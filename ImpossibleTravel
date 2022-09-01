@@ -1,0 +1,71 @@
+## Requires SearchKey set to Alpha2 for a Watchlist
+
+let CountryLookup = _GetWatchlist('regionalMap') | project Region = SearchKey, Country = name;
+let startDate = ago(1d);
+let endDate = now();
+let maxSpeed = 1000;
+let HighRiskCountries = dynamic(["Malaysia","Thailand","Brazil","Russian Federation","China","Nigeria","Indonesia","Egypt","North Korea", "Ukraine", "Switzerland"]);
+SigninLogs
+| where TimeGenerated  between (startDate .. endDate )
+| where ResultType == 0
+| extend Latitude = todouble(LocationDetails.geoCoordinates.latitude)
+    , Longitude = todouble(LocationDetails.geoCoordinates.longitude)
+    , Region = tostring(LocationDetails.countryOrRegion)
+| where isnotempty(Region)
+| join kind = inner 
+    CountryLookup 
+    on Region
+| extend Region = Country
+//Order by username then date so we can find the previous IP & xy Coordinates using prev()
+| order by UserPrincipalName, TimeGenerated
+| extend PreviousIPAddress = prev(IPAddress, 1)
+    , PreviousUserPrincipalName = prev(UserPrincipalName, 1)
+    , PreviousLatitude = prev(Latitude, 1)
+    , PreviousLongitude = prev(Longitude, 1)
+    , PreviousTime = prev(TimeGenerated, 1)
+    , PreviousRegion = prev(Country, 1) 
+// Package the coordinates into an array
+| extend Coordinates = pack_array(Latitude, Longitude)
+    , PreviousCoordinates = pack_array(PreviousLatitude, PreviousLongitude)
+// Check if the previous user and current user are the same, we'll need to know this later when calculating impossible travel
+    , UserPrincipalNameDifference = iff(UserPrincipalName == PreviousUserPrincipalName, "Same", "Different")
+| project TimeGenerated, PreviousTime, UserPrincipalName, PreviousUserPrincipalName, UserPrincipalNameDifference
+    , IPAddress, PreviousIPAddress, Coordinates, PreviousCoordinates, Region, Country, PreviousRegion
+| extend distance = round
+    (
+        geo_distance_2points(todouble(Coordinates[1])
+        , todouble(Coordinates[0])
+        , todouble(PreviousCoordinates[1])
+        , todouble(PreviousCoordinates[0])) / 1000, 0
+    )
+| extend hours = abs
+    (
+        datetime_diff('hour', todatetime(TimeGenerated),todatetime(PreviousTime))
+    )
+| extend speedKmPerHour = round(distance/hours, 0)
+// Check to see is it's possible to get from one location to another within the permitted max speed (providing different countries)
+| extend Countries = strcat(PreviousRegion, " > ", Region)
+| extend HighRiskCountry = iff(Region in (HighRiskCountries), Country, "")
+| extend ImpossibleTravel = iff((speedKmPerHour > maxSpeed) and (Region != PreviousRegion) and (UserPrincipalNameDifference == "Same"), Countries, "")
+| summarize 
+    CountryCount = dcount(Region)
+    , Countries = make_set(Region)
+    , HighRiskCountryCount = dcountif(HighRiskCountry, HighRiskCountry != "")
+    , ImpossibleTravelRouteCount = dcountif(ImpossibleTravel, ImpossibleTravel != "")
+    , ImpossibleTravelRoutes = make_set_if(ImpossibleTravel, ImpossibleTravel != "")
+    , IPAddresses = make_set(IPAddress)
+    , LastAccess = max(TimeGenerated)
+     by UserPrincipalName
+// Only pull out records where Impossible travel has been seen or 4+ countries have been visited & where the latest visit was within the last 4 hours (report will run every 4hrs)  
+| where (ImpossibleTravelRouteCount > 0 or CountryCount > 3) and LastAccess > ago(4h)
+| extend Severity = case
+    (
+        HighRiskCountryCount > 0 and ImpossibleTravelRouteCount > 1,"High",
+        HighRiskCountryCount > 1 , "High",
+        HighRiskCountryCount > 0 and ImpossibleTravelRouteCount > 0, "Medium",
+        ImpossibleTravelRouteCount > 2, "High",
+        ImpossibleTravelRouteCount > 1, "Medium",
+        CountryCount > 3, "Medium",
+        ImpossibleTravelRouteCount > 0, "Low"        
+        ,"?"
+    )
